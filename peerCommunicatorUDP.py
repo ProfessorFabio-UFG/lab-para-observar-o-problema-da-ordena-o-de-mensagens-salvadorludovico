@@ -7,7 +7,6 @@ import pickle
 from requests import get
 import heapq
 from collections import defaultdict
-import os
 
 # Lamport clock for this process
 lamport_clock = 0
@@ -17,9 +16,16 @@ clock_lock = threading.Lock()
 message_queue = []  # Priority queue: (timestamp, sender_id, msg)
 queue_lock = threading.Lock()
 
+# Set to track messages already in queue (avoid duplicates)
+messages_in_queue = set()
+
 # Track acknowledgments received for each message
-acks_received = defaultdict(set)  # {(timestamp, sender_id): set of ack_senders}
+acks_received = defaultdict(set)  # {(timestamp, sender_id, msg_num): set of ack_senders}
 acks_lock = threading.Lock()
+
+# Track messages we've already seen to avoid duplicates
+seen_messages = set()
+seen_lock = threading.Lock()
 
 # Delivered messages log
 delivered_messages = []
@@ -88,12 +94,12 @@ def broadcast_message(msg_type, content):
     for addrToSend in PEERS:
         sendSocket.sendto(content, (addrToSend, PEER_UDP_PORT))
 
-def can_deliver_message(timestamp, sender_id):
+def can_deliver_message(timestamp, sender_id, msg_num):
     """Check if a message can be delivered according to Lamport's algorithm"""
     # A message can be delivered when we have received acknowledgments from all other processes
     with acks_lock:
-        ack_count = len(acks_received.get((timestamp, sender_id), set()))
-        # We need acks from all N processes (including the original sender)
+        ack_count = len(acks_received.get((timestamp, sender_id, msg_num), set()))
+        # We need acks from all N processes
         return ack_count >= N
 
 def try_deliver_messages():
@@ -101,96 +107,129 @@ def try_deliver_messages():
     global delivery_counter
     
     with queue_lock:
-        while message_queue:
-            # Peek at the top message
-            timestamp, sender_id, msg_content = message_queue[0]
-            
-            if can_deliver_message(timestamp, sender_id):
-                # Remove from queue
-                heapq.heappop(message_queue)
+        delivered_any = True
+        while delivered_any and message_queue:
+            delivered_any = False
+            # Check if the top message can be delivered
+            if message_queue:
+                timestamp, sender_id, msg_num = message_queue[0]
                 
-                # Deliver the message
-                with delivery_lock:
-                    delivery_counter += 1
-                    log_entry = f"[P{myself}] | received_from: P{sender_id} | msg_id: m{msg_content} | timestamp: {timestamp} | delivery_order: {delivery_counter}"
-                    print(log_entry)
-                    delivered_messages.append((sender_id, msg_content))
-            else:
-                # Can't deliver yet, stop checking
-                break
+                if can_deliver_message(timestamp, sender_id, msg_num):
+                    # Remove from queue
+                    heapq.heappop(message_queue)
+                    messages_in_queue.discard((timestamp, sender_id, msg_num))
+                    
+                    # Deliver the message
+                    with delivery_lock:
+                        delivery_counter += 1
+                        log_entry = f"[P{myself}] | received_from: P{sender_id} | msg_id: m{msg_num} | timestamp: {timestamp} | delivery_order: {delivery_counter}"
+                        print(log_entry)
+                        delivered_messages.append((sender_id, msg_num))
+                    
+                    delivered_any = True
 
 class MsgHandler(threading.Thread):
     def __init__(self, sock):
         threading.Thread.__init__(self)
         self.sock = sock
+        self.sock.settimeout(1.0)  # Add timeout to avoid blocking forever
 
     def run(self):
+        global handShakeCount, lamport_clock, message_queue, acks_received, delivered_messages, delivery_counter
         
         print('Handler is ready. Waiting for the handshakes...')
         
-        global handShakeCount, lamport_clock, message_queue, acks_received, delivered_messages, delivery_counter
         # Wait until handshakes are received from all other processes
         while handShakeCount < N:
-            msgPack = self.sock.recv(1024)
-            msg = pickle.loads(msgPack)
-            if msg[0] == 'READY':
-                handShakeCount = handShakeCount + 1
-                print('--- Handshake received: ', msg[1])
+            try:
+                msgPack = self.sock.recv(1024)
+                msg = pickle.loads(msgPack)
+                if msg[0] == 'READY':
+                    handShakeCount = handShakeCount + 1
+                    print('--- Handshake received: ', msg[1])
+            except timeout:
+                continue
 
         print('Secondary Thread: Received all handshakes. Entering the loop to receive messages.')
 
         stopCount = 0
-        while True:
-            msgPack = self.sock.recv(1024)
-            msg = pickle.loads(msgPack)
-            
-            if msg[0] == 'STOP':
-                # Stop signal
-                stopCount = stopCount + 1
-                if stopCount == N:
-                    break
-            
-            elif msg[0] == 'DATA':
-                # Data message: ('DATA', sender_id, msg_number, lamport_timestamp)
-                _, sender_id, msg_number, sender_timestamp = msg
+        expected_stop_count = N  # We expect STOP from all N peers including ourselves
+        
+        while stopCount < expected_stop_count:
+            try:
+                msgPack = self.sock.recv(1024)
+                msg = pickle.loads(msgPack)
                 
-                # Update Lamport clock
-                update_lamport_clock(sender_timestamp)
+                if msg[0] == 'STOP':
+                    # Stop signal
+                    stopCount = stopCount + 1
+                    print(f'Received STOP signal {stopCount}/{expected_stop_count}')
                 
-                # Add to message queue
-                with queue_lock:
-                    heapq.heappush(message_queue, (sender_timestamp, sender_id, msg_number))
+                elif msg[0] == 'DATA':
+                    # Data message: ('DATA', sender_id, msg_number, lamport_timestamp)
+                    _, sender_id, msg_number, sender_timestamp = msg
+                    
+                    # Check if we've seen this message before
+                    message_id = (sender_id, msg_number, sender_timestamp)
+                    with seen_lock:
+                        if message_id in seen_messages:
+                            continue  # Skip duplicate
+                        seen_messages.add(message_id)
+                    
+                    # Update Lamport clock
+                    update_lamport_clock(sender_timestamp)
+                    
+                    # Add to message queue if not already there
+                    with queue_lock:
+                        queue_entry = (sender_timestamp, sender_id, msg_number)
+                        if queue_entry not in messages_in_queue:
+                            heapq.heappush(message_queue, queue_entry)
+                            messages_in_queue.add(queue_entry)
+                    
+                    # Send acknowledgment to all peers
+                    ack_timestamp = update_lamport_clock()
+                    ack_msg = ('ACK', myself, sender_id, msg_number, sender_timestamp, ack_timestamp)
+                    ack_pack = pickle.dumps(ack_msg)
+                    broadcast_message('ACK', ack_pack)
+                    
+                    # Record our own ack
+                    with acks_lock:
+                        acks_received[(sender_timestamp, sender_id, msg_number)].add(myself)
+                    
+                    # Try to deliver messages
+                    try_deliver_messages()
                 
-                # Send acknowledgment to all peers
-                ack_timestamp = update_lamport_clock()
-                ack_msg = ('ACK', myself, sender_id, msg_number, sender_timestamp, ack_timestamp)
-                ack_pack = pickle.dumps(ack_msg)
-                broadcast_message('ACK', ack_pack)
-                
-                # Record our own ack
-                with acks_lock:
-                    acks_received[(sender_timestamp, sender_id)].add(myself)
-                
-                # Try to deliver messages
+                elif msg[0] == 'ACK':
+                    # Acknowledgment: ('ACK', ack_sender, original_sender, msg_number, original_timestamp, ack_timestamp)
+                    _, ack_sender, original_sender, msg_number, original_timestamp, ack_timestamp = msg
+                    
+                    # Update Lamport clock
+                    update_lamport_clock(ack_timestamp)
+                    
+                    # Record the acknowledgment
+                    with acks_lock:
+                        acks_received[(original_timestamp, original_sender, msg_number)].add(ack_sender)
+                    
+                    # Try to deliver messages
+                    try_deliver_messages()
+                    
+            except timeout:
+                # Check if we can deliver any pending messages
                 try_deliver_messages()
-            
-            elif msg[0] == 'ACK':
-                # Acknowledgment: ('ACK', ack_sender, original_sender, msg_number, original_timestamp, ack_timestamp)
-                _, ack_sender, original_sender, msg_number, original_timestamp, ack_timestamp = msg
-                
-                # Update Lamport clock
-                update_lamport_clock(ack_timestamp)
-                
-                # Record the acknowledgment
-                with acks_lock:
-                    acks_received[(original_timestamp, original_sender)].add(ack_sender)
-                
-                # Try to deliver messages
-                try_deliver_messages()
+                continue
+            except Exception as e:
+                print(f"Error in message handler: {e}")
+                continue
+        
+        # Wait a bit more to ensure all messages are delivered
+        print("Waiting for final message delivery...")
+        time.sleep(2)
+        try_deliver_messages()
         
         # Write log file
         logFile = open('logfile'+str(myself)+'.log', 'w')
-        logFile.writelines(str(delivered_messages))
+        for entry in delivered_messages:
+            logFile.write(f"{entry}\n")
         logFile.close()
         
         # Send the list of messages to the server for comparison
@@ -202,15 +241,14 @@ class MsgHandler(threading.Thread):
         clientSock.close()
         
         # Reset for next round
-        
         lamport_clock = 0
         message_queue = []
+        messages_in_queue.clear()
         acks_received.clear()
+        seen_messages.clear()
         delivered_messages = []
         delivery_counter = 0
         handShakeCount = 0
-
-        exit(0)
 
 def waitToStart():
     """Wait for start signal from comparison server"""
@@ -272,17 +310,31 @@ while True:
         
         # Add our own message to the queue and record our ack
         with queue_lock:
-            heapq.heappush(message_queue, (timestamp, myself, msgNumber))
+            queue_entry = (timestamp, myself, msgNumber)
+            if queue_entry not in messages_in_queue:
+                heapq.heappush(message_queue, queue_entry)
+                messages_in_queue.add(queue_entry)
+        
         with acks_lock:
-            acks_received[(timestamp, myself)].add(myself)
+            acks_received[(timestamp, myself, msgNumber)].add(myself)
+        
+        # Add to seen messages
+        with seen_lock:
+            seen_messages.add((myself, msgNumber, timestamp))
         
         # Try to deliver messages
         try_deliver_messages()
         
         print(f'Sent message {msgNumber} with timestamp {timestamp}')
 
+    # Give some time for all messages to be processed
+    time.sleep(1)
+
     # Tell all processes that I have no more messages to send
     for addrToSend in PEERS:
         msg = ('STOP', myself)
         msgPack = pickle.dumps(msg)
         sendSocket.sendto(msgPack, (addrToSend, PEER_UDP_PORT))
+    
+    # Wait for handler to finish
+    msgHandler.join()
