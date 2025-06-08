@@ -124,10 +124,10 @@ class MsgHandler(threading.Thread):
         self.sock = sock
 
     def run(self):
+        
         print('Handler is ready. Waiting for the handshakes...')
         
-        global handShakeCount
-        
+        global handShakeCount, lamport_clock, message_queue, acks_received, delivered_messages, delivery_counter
         # Wait until handshakes are received from all other processes
         while handShakeCount < N:
             msgPack = self.sock.recv(1024)
@@ -201,7 +201,7 @@ class MsgHandler(threading.Thread):
         clientSock.close()
         
         # Reset for next round
-        global lamport_clock, message_queue, acks_received, delivered_messages, delivery_counter
+        
         lamport_clock = 0
         message_queue = []
         acks_received.clear()
