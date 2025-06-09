@@ -13,50 +13,53 @@ lamport_clock = 0
 clock_lock = threading.Lock()
 
 # Message queue ordered by Lamport timestamp
-message_queue = []  # Priority queue: (timestamp, sender_id, msg)
+message_queue = []  # Priority queue: (timestamp, sender_id, msg_num)
 queue_lock = threading.Lock()
 
-# Set to track messages already in queue (avoid duplicates)
-messages_in_queue = set()
-
 # Track acknowledgments received for each message
-acks_received = defaultdict(set)  # {(timestamp, sender_id, msg_num): set of ack_senders}
+# Key: (original_timestamp, original_sender, msg_num), Value: set of (ack_sender, ack_timestamp)
+acks_received = defaultdict(set)
 acks_lock = threading.Lock()
 
-# Track messages we've already seen to avoid duplicates
-seen_messages = set()
-seen_lock = threading.Lock()
+# Track handshake confirmations
+handshake_confirmations = set()
+handshake_lock = threading.Lock()
 
 # Delivered messages log
 delivered_messages = []
 delivery_counter = 0
 delivery_lock = threading.Lock()
 
-# Counter to make sure we have received handshakes from all other processes
+# Counter for handshakes
 handShakeCount = 0
 
 PEERS = []
 myself = -1
 nMsgs = 0
 
-# UDP sockets to send and receive data messages:
+# UDP sockets
 sendSocket = socket(AF_INET, SOCK_DGRAM)
 recvSocket = socket(AF_INET, SOCK_DGRAM)
 recvSocket.bind(('0.0.0.0', PEER_UDP_PORT))
 
-# TCP socket to receive start signal from the comparison server:
+# TCP socket for comparison server
 serverSock = socket(AF_INET, SOCK_STREAM)
 serverSock.bind(('0.0.0.0', PEER_TCP_PORT))
 serverSock.listen(1)
 
 def update_lamport_clock(received_timestamp=None):
-    """Update Lamport clock according to the rules"""
+    """Update Lamport clock according to Lamport's rules"""
     global lamport_clock
     with clock_lock:
         if received_timestamp is not None:
             lamport_clock = max(lamport_clock, received_timestamp) + 1
         else:
             lamport_clock += 1
+        return lamport_clock
+
+def get_current_clock():
+    """Get current clock value without updating"""
+    with clock_lock:
         return lamport_clock
 
 def get_public_ip():
@@ -77,47 +80,65 @@ def registerWithGroupManager():
 
 def getListOfPeers():
     clientSock = socket(AF_INET, SOCK_STREAM)
-    print('Connecting to group manager: ', (GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
     clientSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
     req = {"op":"list"}
     msg = pickle.dumps(req)
-    print('Getting list of peers from group manager: ', req)
     clientSock.send(msg)
     msg = clientSock.recv(2048)
     PEERS = pickle.loads(msg)
-    print('Got list of peers: ', PEERS)
     clientSock.close()
     return PEERS
 
-def broadcast_message(msg_type, content):
+def send_with_retries(msg, addr, max_retries=3):
+    """Send message with retries"""
+    for i in range(max_retries):
+        sendSocket.sendto(msg, (addr, PEER_UDP_PORT))
+        time.sleep(0.01 * (i + 1))  # Exponential backoff
+
+def broadcast_message(content):
     """Broadcast a message to all peers"""
     for addrToSend in PEERS:
         sendSocket.sendto(content, (addrToSend, PEER_UDP_PORT))
 
 def can_deliver_message(timestamp, sender_id, msg_num):
-    """Check if a message can be delivered according to Lamport's algorithm"""
-    # A message can be delivered when we have received acknowledgments from all other processes
+    """
+    Check if a message can be delivered according to Lamport's total ordering algorithm.
+    A message m can be delivered when:
+    1. m is at the head of the queue
+    2. For all processes p, we have received a message with timestamp > m.timestamp
+    """
     with acks_lock:
-        ack_count = len(acks_received.get((timestamp, sender_id, msg_num), set()))
-        # We need acks from all N processes
-        return ack_count >= N
+        ack_senders = acks_received.get((timestamp, sender_id, msg_num), set())
+        
+        # We need to have received an ACK from every process
+        if len(ack_senders) < N:
+            return False
+        
+        # Check that all ACKs have timestamps greater than the message timestamp
+        # This ensures all processes have seen this message
+        for ack_sender, ack_timestamp in ack_senders:
+            if ack_timestamp <= timestamp:
+                return False
+                
+        return True
 
 def try_deliver_messages():
-    """Try to deliver messages that are ready"""
+    """Try to deliver messages that are ready according to total ordering"""
     global delivery_counter
     
     with queue_lock:
-        delivered_any = True
-        while delivered_any and message_queue:
-            delivered_any = False
-            # Check if the top message can be delivered
+        delivered = True
+        while delivered and message_queue:
+            delivered = False
+            
+            # Peek at the head of the queue
             if message_queue:
                 timestamp, sender_id, msg_num = message_queue[0]
                 
+                # Check if this message can be delivered
                 if can_deliver_message(timestamp, sender_id, msg_num):
                     # Remove from queue
                     heapq.heappop(message_queue)
-                    messages_in_queue.discard((timestamp, sender_id, msg_num))
                     
                     # Deliver the message
                     with delivery_lock:
@@ -126,129 +147,153 @@ def try_deliver_messages():
                         print(log_entry)
                         delivered_messages.append((sender_id, msg_num))
                     
-                    delivered_any = True
+                    delivered = True
 
 class MsgHandler(threading.Thread):
     def __init__(self, sock):
         threading.Thread.__init__(self)
         self.sock = sock
-        self.sock.settimeout(1.0)  # Add timeout to avoid blocking forever
+        self.running = True
 
     def run(self):
-        global handShakeCount, lamport_clock, message_queue, acks_received, delivered_messages, delivery_counter
+        global handShakeCount
         
-        print('Handler is ready. Waiting for the handshakes...')
+        print('Handler is ready. Waiting for handshakes...')
         
-        # Wait until handshakes are received from all other processes
-        while handShakeCount < N:
+        # Phase 1: Handshake exchange with confirmation
+        handshake_timeout = time.time() + 30  # 30 second timeout
+        
+        while handShakeCount < N and time.time() < handshake_timeout:
             try:
-                msgPack = self.sock.recv(1024)
+                self.sock.settimeout(0.5)
+                msgPack, addr = self.sock.recvfrom(1024)
                 msg = pickle.loads(msgPack)
-                if msg[0] == 'READY':
-                    handShakeCount = handShakeCount + 1
-                    print('--- Handshake received: ', msg[1])
+                
+                if msg[0] == 'HANDSHAKE':
+                    sender = msg[1]
+                    print(f'--- Handshake received from P{sender}')
+                    
+                    # Send confirmation
+                    confirm_msg = ('HANDSHAKE_CONFIRM', myself, sender)
+                    confirm_pack = pickle.dumps(confirm_msg)
+                    sendSocket.sendto(confirm_pack, addr)
+                    
+                    with handshake_lock:
+                        if sender not in handshake_confirmations:
+                            handshake_confirmations.add(sender)
+                            handShakeCount = len(handshake_confirmations)
+                
+                elif msg[0] == 'HANDSHAKE_CONFIRM':
+                    confirmer = msg[1]
+                    original_sender = msg[2]
+                    
+                    if original_sender == myself:
+                        with handshake_lock:
+                            if confirmer not in handshake_confirmations:
+                                handshake_confirmations.add(confirmer)
+                                handShakeCount = len(handshake_confirmations)
+                                print(f'--- Handshake confirmed by P{confirmer}')
+                                
             except timeout:
                 continue
+            except Exception as e:
+                print(f"Handshake error: {e}")
+                continue
 
-        print('Secondary Thread: Received all handshakes. Entering the loop to receive messages.')
+        if handShakeCount < N:
+            print(f"WARNING: Only received {handShakeCount}/{N} handshake confirmations")
+        else:
+            print(f"All {N} handshakes confirmed. Starting message exchange...")
 
-        stopCount = 0
-        expected_stop_count = N  # We expect STOP from all N peers including ourselves
+        # Phase 2: Message exchange
+        self.sock.settimeout(1.0)
+        stop_count = 0
+        message_count = 0
         
-        while stopCount < expected_stop_count:
+        while stop_count < N and self.running:
             try:
-                msgPack = self.sock.recv(1024)
+                msgPack, addr = self.sock.recvfrom(4096)
                 msg = pickle.loads(msgPack)
                 
                 if msg[0] == 'STOP':
-                    # Stop signal
-                    stopCount = stopCount + 1
-                    print(f'Received STOP signal {stopCount}/{expected_stop_count}')
+                    stop_count += 1
+                    print(f'Received STOP {stop_count}/{N}')
                 
                 elif msg[0] == 'DATA':
                     # Data message: ('DATA', sender_id, msg_number, lamport_timestamp)
                     _, sender_id, msg_number, sender_timestamp = msg
                     
-                    # Check if we've seen this message before
-                    message_id = (sender_id, msg_number, sender_timestamp)
-                    with seen_lock:
-                        if message_id in seen_messages:
-                            continue  # Skip duplicate
-                        seen_messages.add(message_id)
-                    
                     # Update Lamport clock
-                    update_lamport_clock(sender_timestamp)
+                    current_time = update_lamport_clock(sender_timestamp)
                     
-                    # Add to message queue if not already there
+                    # Add to message queue
                     with queue_lock:
-                        queue_entry = (sender_timestamp, sender_id, msg_number)
-                        if queue_entry not in messages_in_queue:
-                            heapq.heappush(message_queue, queue_entry)
-                            messages_in_queue.add(queue_entry)
+                        # Use tuple for proper ordering: (timestamp, sender_id, msg_num)
+                        heapq.heappush(message_queue, (sender_timestamp, sender_id, msg_number))
                     
-                    # Send acknowledgment to all peers
-                    ack_timestamp = update_lamport_clock()
-                    ack_msg = ('ACK', myself, sender_id, msg_number, sender_timestamp, ack_timestamp)
+                    # Send ACK to all processes
+                    ack_msg = ('ACK', myself, sender_id, msg_number, sender_timestamp, current_time)
                     ack_pack = pickle.dumps(ack_msg)
-                    broadcast_message('ACK', ack_pack)
+                    broadcast_message(ack_pack)
                     
-                    # Record our own ack
+                    # Record our own ACK
                     with acks_lock:
-                        acks_received[(sender_timestamp, sender_id, msg_number)].add(myself)
+                        acks_received[(sender_timestamp, sender_id, msg_number)].add((myself, current_time))
+                    
+                    message_count += 1
                     
                     # Try to deliver messages
                     try_deliver_messages()
                 
                 elif msg[0] == 'ACK':
-                    # Acknowledgment: ('ACK', ack_sender, original_sender, msg_number, original_timestamp, ack_timestamp)
+                    # ACK: ('ACK', ack_sender, original_sender, msg_number, original_timestamp, ack_timestamp)
                     _, ack_sender, original_sender, msg_number, original_timestamp, ack_timestamp = msg
                     
                     # Update Lamport clock
                     update_lamport_clock(ack_timestamp)
                     
-                    # Record the acknowledgment
+                    # Record the ACK
                     with acks_lock:
-                        acks_received[(original_timestamp, original_sender, msg_number)].add(ack_sender)
+                        acks_received[(original_timestamp, original_sender, msg_number)].add((ack_sender, ack_timestamp))
                     
                     # Try to deliver messages
                     try_deliver_messages()
                     
             except timeout:
-                # Check if we can deliver any pending messages
+                # Periodically try to deliver messages
                 try_deliver_messages()
-                continue
             except Exception as e:
-                print(f"Error in message handler: {e}")
+                print(f"Message handling error: {e}")
                 continue
+
+        print(f"Received {message_count} messages total")
         
-        # Wait a bit more to ensure all messages are delivered
-        print("Waiting for final message delivery...")
-        time.sleep(2)
+        # Final delivery attempt
+        print("Final delivery check...")
+        time.sleep(1)
         try_deliver_messages()
         
+        # Log results
+        print(f"Total delivered: {len(delivered_messages)}")
+        
         # Write log file
-        logFile = open('logfile'+str(myself)+'.log', 'w')
-        for entry in delivered_messages:
-            logFile.write(f"{entry}\n")
-        logFile.close()
+        with open(f'logfile{myself}.log', 'w') as logFile:
+            for entry in delivered_messages:
+                logFile.write(f"{entry}\n")
         
-        # Send the list of messages to the server for comparison
-        print('Sending the list of messages to the server for comparison...')
-        clientSock = socket(AF_INET, SOCK_STREAM)
-        clientSock.connect((SERVER_ADDR, SERVER_PORT))
-        msgPack = pickle.dumps(delivered_messages)
-        clientSock.send(msgPack)
-        clientSock.close()
-        
-        # Reset for next round
-        lamport_clock = 0
-        message_queue = []
-        messages_in_queue.clear()
-        acks_received.clear()
-        seen_messages.clear()
-        delivered_messages = []
-        delivery_counter = 0
-        handShakeCount = 0
+        # Send results to comparison server
+        print('Sending results to comparison server...')
+        try:
+            clientSock = socket(AF_INET, SOCK_STREAM)
+            clientSock.connect((SERVER_ADDR, SERVER_PORT))
+            msgPack = pickle.dumps(delivered_messages)
+            clientSock.send(msgPack)
+            clientSock.close()
+        except Exception as e:
+            print(f"Error sending to comparison server: {e}")
+
+    def stop(self):
+        self.running = False
 
 def waitToStart():
     """Wait for start signal from comparison server"""
@@ -257,84 +302,110 @@ def waitToStart():
     msg = pickle.loads(msgPack)
     myself = msg[0]
     nMsgs = msg[1]
-    conn.send(pickle.dumps('Peer process '+str(myself)+' started.'))
+    conn.send(pickle.dumps(f'Peer process {myself} started.'))
     conn.close()
     return (myself, nMsgs)
+
+def reset_state():
+    """Reset all state for next round"""
+    global lamport_clock, message_queue, acks_received, delivered_messages
+    global delivery_counter, handShakeCount, handshake_confirmations
+    
+    lamport_clock = 0
+    message_queue = []
+    acks_received.clear()
+    delivered_messages = []
+    delivery_counter = 0
+    handShakeCount = 0
+    handshake_confirmations.clear()
 
 # Main execution
 registerWithGroupManager()
 
 while True:
-    print('Waiting for signal to start...')
+    print('\n=== Waiting for signal to start ===')
     (myself, nMsgs) = waitToStart()
-    print('I am up, and my ID is: ', str(myself))
-
+    print(f'Starting as Peer {myself} with {nMsgs} messages to send')
+    
     if nMsgs == 0:
         print('Terminating.')
-        exit(0)
-
-    # Wait for other processes to be ready
-    time.sleep(5)
-
-    # Create receiving message handler
+        break
+    
+    # Reset state from previous round
+    reset_state()
+    
+    # Get peer list
+    PEERS = getListOfPeers()
+    print(f'Peer list: {PEERS}')
+    
+    # Start message handler
     msgHandler = MsgHandler(recvSocket)
     msgHandler.start()
-    print('Handler started')
-
-    PEERS = getListOfPeers()
     
-    # Send handshakes
-    for addrToSend in PEERS:
-        print('Sending handshake to ', addrToSend)
-        msg = ('READY', myself)
-        msgPack = pickle.dumps(msg)
-        sendSocket.sendto(msgPack, (addrToSend, PEER_UDP_PORT))
-
-    print('Main Thread: Sent all handshakes. handShakeCount=', str(handShakeCount))
-
-    while handShakeCount < N:
+    # Wait a bit for all peers to start
+    time.sleep(3)
+    
+    # Send handshakes with retries
+    print("Sending handshakes...")
+    for i in range(5):  # Try 5 times
+        for addr in PEERS:
+            msg = ('HANDSHAKE', myself)
+            msgPack = pickle.dumps(msg)
+            sendSocket.sendto(msgPack, (addr, PEER_UDP_PORT))
+        
+        time.sleep(0.5)
+        
+        with handshake_lock:
+            if len(handshake_confirmations) >= N:
+                break
+    
+    # Wait for all handshakes
+    timeout = time.time() + 10
+    while handShakeCount < N and time.time() < timeout:
         time.sleep(0.1)
-
-    # Send a sequence of data messages to all other processes
-    for msgNumber in range(0, nMsgs):
-        # Wait some random time between successive messages
+    
+    print(f"Handshake phase complete: {handShakeCount}/{N}")
+    
+    # Send messages
+    for msgNumber in range(nMsgs):
+        # Random delay
         time.sleep(random.randrange(10, 100) / 1000)
         
-        # Update Lamport clock and send message
+        # Update clock and create message
         timestamp = update_lamport_clock()
         msg = ('DATA', myself, msgNumber, timestamp)
         msgPack = pickle.dumps(msg)
         
-        # Broadcast to all peers
-        broadcast_message('DATA', msgPack)
-        
-        # Add our own message to the queue and record our ack
+        # Add to our own queue
         with queue_lock:
-            queue_entry = (timestamp, myself, msgNumber)
-            if queue_entry not in messages_in_queue:
-                heapq.heappush(message_queue, queue_entry)
-                messages_in_queue.add(queue_entry)
+            heapq.heappush(message_queue, (timestamp, myself, msgNumber))
         
+        # Record our own ACK
         with acks_lock:
-            acks_received[(timestamp, myself, msgNumber)].add(myself)
+            acks_received[(timestamp, myself, msgNumber)].add((myself, timestamp + 1))
         
-        # Add to seen messages
-        with seen_lock:
-            seen_messages.add((myself, msgNumber, timestamp))
-        
-        # Try to deliver messages
-        try_deliver_messages()
+        # Broadcast message
+        broadcast_message(msgPack)
         
         print(f'Sent message {msgNumber} with timestamp {timestamp}')
-
-    # Give some time for all messages to be processed
-    time.sleep(1)
-
-    # Tell all processes that I have no more messages to send
-    for addrToSend in PEERS:
-        msg = ('STOP', myself)
-        msgPack = pickle.dumps(msg)
-        sendSocket.sendto(msgPack, (addrToSend, PEER_UDP_PORT))
+        
+        # Try to deliver
+        try_deliver_messages()
+    
+    # Wait a bit for message propagation
+    time.sleep(2)
+    
+    # Send STOP signal
+    print("Sending STOP signals...")
+    stop_msg = ('STOP', myself)
+    stop_pack = pickle.dumps(stop_msg)
+    for _ in range(3):  # Send multiple times
+        broadcast_message(stop_pack)
+        time.sleep(0.1)
     
     # Wait for handler to finish
-    msgHandler.join()
+    msgHandler.join(timeout=30)
+    
+    if msgHandler.is_alive():
+        print("Warning: Handler thread did not finish")
+        msgHandler.stop()
