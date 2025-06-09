@@ -1,6 +1,6 @@
 from socket import *
 import pickle
-from constMP import *
+from env_variables import *
 import time
 import sys
 
@@ -52,7 +52,7 @@ def waitForLogsAndCompare(N_MSGS):
 	msgs = [] # each msg is a list of tuples (with the original messages received by the peer processes)
 
 	# Receive the logs of messages from the peer processes
-	while numPeers < N:
+	while numPeers < PEERS_NUMBER:
 		(conn, addr) = serverSock.accept()
 		msgPack = conn.recv(32768)
 		print ('Received log from peer')
@@ -65,7 +65,7 @@ def waitForLogsAndCompare(N_MSGS):
 	# Compare the lists of messages
 	for j in range(0,N_MSGS-1):
 		firstMsg = msgs[0][j]
-		for i in range(1,N-1):
+		for i in range(1,PEERS_NUMBER-1):
 			if firstMsg != msgs[i][j]:
 				unordered = unordered + 1
 				break

@@ -1,6 +1,6 @@
 from socket import *
 import pickle
-from constMP import *
+from env_variables import *
 
 port = GROUPMNGR_TCP_PORT
 membership = []
@@ -8,7 +8,7 @@ membership = []
 def serverLoop():
   serverSock = socket(AF_INET, SOCK_STREAM)
   serverSock.bind(('0.0.0.0', port))
-  serverSock.listen(6)
+  serverSock.listen(PEERS_NUMBER)
   while(1):
     (conn, addr) = serverSock.accept()
     msgPack = conn.recv(2048)

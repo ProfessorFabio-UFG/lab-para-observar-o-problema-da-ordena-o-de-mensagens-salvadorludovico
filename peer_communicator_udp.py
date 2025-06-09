@@ -1,5 +1,5 @@
 from socket  import *
-from constMP import * #-
+from env_variables import * #-
 import threading
 import random
 import time
@@ -72,7 +72,7 @@ class MsgHandler(threading.Thread):
     
     # Wait until handshakes are received from all other processes
     # (to make sure that all processes are synchronized before they start exchanging messages)
-    while handShakeCount < N:
+    while handShakeCount < PEERS_NUMBER:
       msgPack = self.sock.recv(1024)
       msg = pickle.loads(msgPack)
       #print ('########## unpickled msgPack: ', msg)
@@ -92,7 +92,7 @@ class MsgHandler(threading.Thread):
       msg = pickle.loads(msgPack)
       if msg[0] == -1:   # count the 'stop' messages from the other processes
         stopCount = stopCount + 1
-        if stopCount == N:
+        if stopCount == PEERS_NUMBER:
           break  # stop loop when all other processes have finished
       else:
         print('Message ' + str(msg[1]) + ' from process ' + str(msg[0]))
@@ -162,7 +162,7 @@ while 1:
 
   print('Main Thread: Sent all handshakes. handShakeCount=', str(handShakeCount))
 
-  while (handShakeCount < N):
+  while (handShakeCount < PEERS_NUMBER):
     pass  # find a better way to wait for the handshakes
 
   # Send a sequence of data messages to all other processes 
